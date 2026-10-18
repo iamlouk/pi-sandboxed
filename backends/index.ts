@@ -5,28 +5,24 @@
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { backendCleanupApple, newAppleSandbox, runAppleExec } from "./apple.ts";
 import { backendCleanupDocker, newDockerSandbox, runDockerExec } from "./docker.ts";
-import { backendCleanupLima, newLimaSandbox } from "./lima.ts";
-import { type AnyBackend, type BackendResult, BackendUnavailableError } from "./types.ts";
+import { type AnyBackend, type BackendResult, BackendUnavailableError, type ReadOnlyMount } from "./types.ts";
 
 export { BackendUnavailableError, DEFAULT_CONFIG, SandboxConfig } from "./types.ts";
 export { containerEnv, hostDirForSandbox, sandboxName } from "./utils.ts";
 
 async function tryBackend(
-	type: "apple" | "docker" | "lima",
+	type: "apple" | "docker",
 	image: string,
 	networkIsolated: boolean,
 	mounts: Record<string, string>,
 	workdirMount: string,
+	readOnlyMounts: ReadOnlyMount[],
 ): Promise<AnyBackend | null> {
 	switch (type) {
 		case "apple":
-			return newAppleSandbox(image, networkIsolated, mounts, workdirMount);
+			return newAppleSandbox(image, networkIsolated, mounts, workdirMount, readOnlyMounts);
 		case "docker":
-			return newDockerSandbox(image, networkIsolated, mounts, workdirMount);
-		case "lima":
-			return newLimaSandbox(image, networkIsolated, mounts, workdirMount);
-		default:
-			return null;
+			return newDockerSandbox(image, networkIsolated, mounts, workdirMount, readOnlyMounts);
 	}
 }
 
@@ -36,14 +32,16 @@ export async function selectBackend(
 	networkIsolated: boolean,
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
+	readOnlyMounts: ReadOnlyMount[] = [],
 ): Promise<BackendResult | null> {
 	if (forced && forced !== "auto") {
 		const backend = await tryBackend(
-			forced as "apple" | "docker" | "lima",
+			forced as "apple" | "docker",
 			image,
 			networkIsolated,
 			mounts,
 			workdirMount,
+			readOnlyMounts,
 		);
 		if (backend) {
 			return { backend, cleanup: () => backendCleanup(backend), networkIsolated };
@@ -51,10 +49,10 @@ export async function selectBackend(
 		throw new BackendUnavailableError(`Forced backend ${forced} is not available`);
 	}
 
-	// Try auto selection: apple -> docker -> lima
-	const backends = ["apple", "docker", "lima"] as const;
+	// Try auto selection: apple -> docker
+	const backends = ["apple", "docker"] as const;
 	for (const type of backends) {
-		const backend = await tryBackend(type, image, networkIsolated, mounts, workdirMount);
+		const backend = await tryBackend(type, image, networkIsolated, mounts, workdirMount, readOnlyMounts);
 		if (backend) {
 			return { backend, cleanup: () => backendCleanup(backend), networkIsolated };
 		}
@@ -69,8 +67,6 @@ async function backendCleanup(backend: AnyBackend): Promise<void> {
 			return backendCleanupDocker(backend);
 		case "apple":
 			return backendCleanupApple(backend);
-		case "lima":
-			return backendCleanupLima(backend);
 	}
 }
 
@@ -85,12 +81,6 @@ export function createSandboxedBashOps(backend: AnyBackend): BashOperations {
 
 				case "apple":
 					return runAppleExec(backend, command, effectiveTimeout, onData, signal);
-
-				case "lima":
-					if (!backend.innerBackend) {
-						throw new Error("Lima backend not initialized");
-					}
-					return runDockerExec(backend.innerBackend, command, effectiveTimeout, onData, signal);
 
 				default:
 					throw new Error(`Unknown backend type: ${(backend as any).type}`);

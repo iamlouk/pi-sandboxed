@@ -4,7 +4,7 @@
  */
 
 import { platform } from "node:os";
-import { type AppleBackend, BackendUnavailableError } from "./types.ts";
+import { type AppleBackend, BackendUnavailableError, type ReadOnlyMount } from "./types.ts";
 import {
 	containerEnv,
 	findExecutableSync,
@@ -19,6 +19,7 @@ export async function newAppleSandbox(
 	networkIsolated: boolean,
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
+	readOnlyMounts: ReadOnlyMount[] = [],
 ): Promise<AppleBackend | null> {
 	if (platform() !== "darwin") {
 		return null;
@@ -59,6 +60,11 @@ export async function newAppleSandbox(
 		for (const [hostPath, containerPath] of Object.entries(mounts)) {
 			const expandedHostPath = hostPath.replace(/^~/, `${homedir()}/`);
 			args.push("--mount", `type=virtiofs,source=${expandedHostPath},target=${containerPath}`);
+		}
+
+		// Read-only overlay mounts (e.g. protected config paths)
+		for (const ro of readOnlyMounts) {
+			args.push("--read-only-path", ro.container);
 		}
 
 		// Network isolation: add --network none if enabled

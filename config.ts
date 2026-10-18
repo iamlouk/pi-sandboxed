@@ -7,6 +7,14 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, type SandboxConfig } from "./backends/types";
 
+/** File paths of the pi-sandboxed config files (project-local and global). */
+export function configFilePaths(cwd: string): { project: string; global: string } {
+	return {
+		project: join(cwd, CONFIG_DIR_NAME, "pi-sandboxed.json"),
+		global: join(getAgentDir(), "extensions", "pi-sandboxed.json"),
+	};
+}
+
 export function loadConfig(cwd: string): SandboxConfig {
 	const projectConfigPath = join(cwd, CONFIG_DIR_NAME, "pi-sandboxed.json");
 	const globalConfigPath = join(getAgentDir(), "extensions", "pi-sandboxed.json");

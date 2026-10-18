@@ -2,7 +2,7 @@
  * pi-sandboxed - Container-based sandbox extension for pi
  *
  * Runs all commands in isolated containers. When enabled:
- * - bash commands run in sandboxed container (apple/docker/lima backend)
+ * - bash commands run in sandboxed container (apple/docker backend)
  * - read/write/edit tools are restricted to mounted directories:
  *   container paths are rewritten to their host equivalents (the tools
  *   operate on the host filesystem, but the mounted dirs are the same
@@ -10,17 +10,28 @@
  * - Network access is DISABLED by default (configurable)
  * - Additional host directories can be mounted into container
  *
+ * Independently of the sandbox:
+ * - `choices` tool: ask the user multiple-choice questions
+ * - `hostTools` config: user-authored allowlist of shell commands exposed to
+ *   the LLM as custom tools that run on the HOST (e.g. "ninja test")
+ * - the pi-sandboxed config files are protected: write/edit tools are blocked
+ *   from modifying them, and the project `.pi` dir is mounted read-only into
+ *   the container so sandboxed bash cannot touch it either
+ *
  * This mirrors the sandbox implementation from lllm (~/dev/projects/047-llm-harness).
  */
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { posix, resolve as resolvePath } from "node:path";
+import { join, posix, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 
 import { createSandboxedBashOps, DEFAULT_CONFIG, sandboxName, selectBackend } from "./backends/index";
-import type { AnyBackend } from "./backends/types";
-import { loadConfig } from "./config";
+import type { AnyBackend, ReadOnlyMount } from "./backends/types";
+import { configFilePaths, loadConfig } from "./config";
+import { registerChoicesTool } from "./extras/choices";
+import { registerHostTools } from "./extras/host-tools";
 
 /** A container path -> host path mapping for a mounted directory */
 interface MountMapping {
@@ -40,6 +51,8 @@ interface SandboxState {
 	workdirMount: string;
 	/** All mounted directories, including the workdir */
 	mounts: MountMapping[];
+	/** Read-only overlay mounts applied to the container (protected paths) */
+	readOnlyMounts: ReadOnlyMount[];
 }
 
 /** True if `candidate` is `root` or inside it. Both must be absolute, normalized paths. */
@@ -54,9 +67,7 @@ function toAbsoluteHostPath(p: string, base: string): string {
 }
 
 /**
- * Map a container path to a host path, or null if the path is outside all mounts.
- * Returns the rewritten host path; falls back to `resolvedElsewhere` when the
- * mapping succeeded without changing the path.
+ * Map a container path to a host path, or block if the path is outside all mounts.
  */
 function containerToHostPath(
 	p: string,
@@ -88,7 +99,10 @@ function containerToHostPath(
 		}
 	}
 	if (best) {
-		const hostPath = resolvePath(best.host, normalized.slice(best.container.length));
+		// posix.relative strips the container prefix without leaving a leading
+		// slash (a plain slice would make the remainder absolute and drop the
+		// host base when passed to resolvePath).
+		const hostPath = resolvePath(best.host, posix.relative(best.container, normalized));
 		return { hostPath };
 	}
 
@@ -98,6 +112,23 @@ function containerToHostPath(
 }
 
 export default function (pi: ExtensionAPI) {
+	const localCwd = process.cwd();
+	const configPaths = configFilePaths(localCwd);
+	// Project pi config dir: protected from agent modification in every mode
+	const projectPiDir = join(localCwd, ".pi");
+
+	/** Host paths the agent must never modify (reading is fine) */
+	function isProtectedHostPath(hostPath: string): boolean {
+		return isWithin(projectPiDir, hostPath) || hostPath === configPaths.global;
+	}
+
+	// Extras: choices tool for asking the user multiple-choice questions
+	registerChoicesTool(pi);
+
+	// Extras: user-configured host tools (from pi-sandboxed.json). These are an
+	// explicit user-authored allowlist - the agent cannot register new ones.
+	const hostToolNames = registerHostTools(pi, loadConfig(localCwd).hostTools, localCwd);
+
 	// CLI flags
 	pi.registerFlag("no-sandbox", {
 		description: "Disable container-based sandboxing",
@@ -106,7 +137,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerFlag("sandbox-backend", {
-		description: "Force backend: apple, docker, lima, or auto",
+		description: "Force backend: apple, docker, or auto",
 		type: "string",
 		default: "auto",
 	});
@@ -124,12 +155,23 @@ export default function (pi: ExtensionAPI) {
 		multiple: true,
 	});
 
-	const localCwd = process.cwd();
 	const localBash = createBashTool(localCwd);
 
 	// Single source of truth: sandbox != null only after the backend is fully
 	// initialized (backend, cleanup and config are set atomically together).
 	let sandbox: SandboxState | null = null;
+
+	/** Warn if the project pi-sandboxed.json exists but is not protected (ro-mounted). */
+	function warnIfConfigUnprotected(ctx: { ui: { notify: (msg: string, kind: string) => void } }, reason: string) {
+		if (existsSync(configPaths.project)) {
+			ctx.ui.notify(
+				`pi-sandboxed.json is present but NOT protected (${reason}). ` +
+					"The agent can modify it (e.g. to disable the sandbox or add host tools for the next session). " +
+					"Start the sandbox or move the config to a protected location.",
+				"warning",
+			);
+		}
+	}
 
 	// Override bash tool with sandboxed version
 	pi.registerTool({
@@ -177,11 +219,14 @@ export default function (pi: ExtensionAPI) {
 							.map((m) => `${m.container} (host: hidden)`)
 							.join(", ")}.\n`
 					: "") +
+				(sandbox.readOnlyMounts.length > 0
+					? `Read-only (do not attempt to modify): ${sandbox.readOnlyMounts.map((m) => m.container).join(", ")}.\n`
+					: "") +
 				`Use the bash tool to access files outside the mounted directories.`,
 		};
 	});
 
-	// Restrict read/write/edit to the mounted directories.
+	// Restrict read/write/edit to the mounted directories, and protect the config.
 	//
 	// Important: these tools run on the HOST filesystem (pi resolves the path
 	// against the host cwd and calls host fs operations). The mounted dirs are
@@ -190,21 +235,46 @@ export default function (pi: ExtensionAPI) {
 	//  1. rewrite container paths (e.g. /workdir/foo) to their host equivalents,
 	//  2. resolve relative paths against the host cwd and require them to stay
 	//     inside a mounted host dir (blocks ../../ escapes),
-	//  3. block absolute paths that map to no mount.
+	//  3. block absolute paths that map to no mount,
+	//  4. block write/edit to protected config paths in every mode - without
+	//     this, an agent could edit pi-sandboxed.json to grant itself host
+	//     tools or disable the sandbox for the next session.
 	// Without the rewrite, /workdir would either fail (no such host path) or,
 	// worse, hit an unrelated real host /workdir — an escape hatch.
 	pi.on("tool_call", (event: any) => {
-		if (!sandbox) return;
 		if (event.toolName !== "read" && event.toolName !== "write" && event.toolName !== "edit") return;
 
 		const path = event.input?.path;
 		if (typeof path !== "string" || !path) return;
 
-		const result = containerToHostPath(path, sandbox.mounts, localCwd);
-		if ("block" in result) return { block: true, reason: result.block };
+		// Resolve to a host path. Sandboxed: map through the mounts (may block).
+		// Unsandboxed: resolve relative paths against the host cwd as pi would.
+		let hostPath: string;
+		if (process.env.PI_SANDBOXED_DEBUG)
+			console.error(
+				`[pi-sandboxed] tool_call ${event.toolName} path=${path} sandbox=${!!sandbox} mounts=${sandbox ? JSON.stringify(sandbox.mounts) : null} localCwd=${localCwd}`,
+			);
+		if (sandbox) {
+			const result = containerToHostPath(path, sandbox.mounts, localCwd);
+			if ("block" in result) return { block: true, reason: result.block };
+			hostPath = result.hostPath;
+		} else {
+			hostPath = toAbsoluteHostPath(path, localCwd);
+		}
 
+		// Protected config paths: read-only for the agent, in every mode.
+		if (event.toolName !== "read" && isProtectedHostPath(hostPath)) {
+			return {
+				block: true,
+				reason:
+					`Refusing to modify protected config path '${path}'. ` +
+					"The pi-sandboxed configuration is managed by the user; ask the user to change it.",
+			};
+		}
+
+		if (process.env.PI_SANDBOXED_DEBUG) console.error(`[pi-sandboxed] -> hostPath=${hostPath}`);
 		// Mutate input in place: the tool then resolves/executes the host path.
-		event.input.path = result.hostPath;
+		if (sandbox) event.input.path = hostPath;
 		return;
 	});
 
@@ -217,12 +287,14 @@ export default function (pi: ExtensionAPI) {
 
 		if (noSandbox) {
 			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+			warnIfConfigUnprotected(ctx, "sandbox disabled via --no-sandbox");
 			return;
 		}
 
 		const config = loadConfig(ctx.cwd);
 		if (!config.enabled!) {
 			ctx.ui.notify("Sandbox disabled via config", "info");
+			warnIfConfigUnprotected(ctx, "sandbox disabled via config");
 			return;
 		}
 
@@ -243,6 +315,13 @@ export default function (pi: ExtensionAPI) {
 		const netInfo = networkIsolated ? "NO network" : "network allowed";
 		const workdirMount = posix.normalize(config.workdirMount || DEFAULT_CONFIG.workdirMount!);
 
+		// Read-only protection for the project pi config dir: if the sandbox
+		// config lives inside the mounted workdir, sandboxed bash could edit it
+		// through the bind mount. Overlay-mount .pi read-only to prevent that.
+		const readOnlyMounts: ReadOnlyMount[] = existsSync(projectPiDir)
+			? [{ host: projectPiDir, container: posix.join(workdirMount, ".pi") }]
+			: [];
+
 		try {
 			const result = await selectBackend(
 				forcedBackend,
@@ -250,9 +329,10 @@ export default function (pi: ExtensionAPI) {
 				networkIsolated,
 				mounts,
 				workdirMount,
+				readOnlyMounts,
 			);
 			if (!result) {
-				throw new Error("No sandbox backend available (tried apple, docker, lima)");
+				throw new Error("No sandbox backend available (tried apple, docker)");
 			}
 
 			// Build the container -> host mount map (workdir first, then extra mounts)
@@ -273,6 +353,7 @@ export default function (pi: ExtensionAPI) {
 				networkIsolated,
 				workdirMount,
 				mounts: mountMappings,
+				readOnlyMounts,
 			};
 			sandbox = state;
 
@@ -287,11 +368,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Build mount list including the workdir
-			const allMounts = mountMappings.map(
-				(m) => `${m.container} (host: ${m.host === localCwd ? localCwd : m.host})`,
-			);
+			const allMounts = mountMappings.map((m) => `${m.container} (host: ${m.host})`);
+			const roList = readOnlyMounts.map((m) => m.container).join(", ");
 			ctx.ui.notify(
-				`Sandbox: ${state.backendType} backend, ${netInfo}, image: ${state.image}, mounts: ${allMounts.join(", ")}`,
+				`Sandbox: ${state.backendType} backend, ${netInfo}, image: ${state.image}, mounts: ${allMounts.join(", ")}` +
+					(roList ? `, read-only: ${roList}` : ""),
 				"info",
 			);
 		} catch (err) {
@@ -326,6 +407,10 @@ export default function (pi: ExtensionAPI) {
 				sandbox && sandbox.mounts.length > 1
 					? ["", "Mounts:", ...sandbox.mounts.map((m) => `  ${m.container} (host: ${m.host})`)]
 					: [];
+			const roLines =
+				sandbox && sandbox.readOnlyMounts.length > 0
+					? ["", "Read-only (protected):", ...sandbox.readOnlyMounts.map((m) => `  ${m.container}`)]
+					: [];
 
 			ctx.ui.notify(
 				[
@@ -334,6 +419,9 @@ export default function (pi: ExtensionAPI) {
 					`Network: ${networkIsolated ? "ISOLATED" : "ALLOWED"}`,
 					`Backend: ${config.backend} (forced: ${forcedBackend || "none"})`,
 					...mountLines,
+					...roLines,
+					`Host tools: ${hostToolNames.length > 0 ? hostToolNames.join(", ") : "none"}`,
+					`Config protected: ${existsSync(projectPiDir) ? (sandbox ? "yes (.pi read-only)" : "write/edit only") : "no .pi dir"}`,
 					`Container: ${sandbox ? sandboxName() : "none"}`,
 				].join("\n"),
 				"info",

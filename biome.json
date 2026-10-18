@@ -24,6 +24,6 @@
 		"lineWidth": 120
 	},
 	"files": {
-		"includes": ["*.ts", "backends/**/*.ts"]
+		"includes": ["*.ts", "backends/**/*.ts", "extras/**/*.ts"]
 	}
 }

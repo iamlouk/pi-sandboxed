@@ -2,7 +2,7 @@
  * Docker backend: drives any reachable Docker daemon through the @moby/moby SDK
  */
 
-import { BackendUnavailableError, type DockerBackend } from "./types.ts";
+import { BackendUnavailableError, type DockerBackend, type ReadOnlyMount } from "./types.ts";
 import { containerEnv, hostDirForSandbox, isPidAlive, sandboxName } from "./utils.ts";
 
 export async function newDockerSandboxAt(
@@ -11,6 +11,7 @@ export async function newDockerSandboxAt(
 	networkIsolated: boolean,
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
+	readOnlyMounts: ReadOnlyMount[] = [],
 ): Promise<DockerBackend | null> {
 	try {
 		const moby = await import("@moby/moby");
@@ -24,7 +25,15 @@ export async function newDockerSandboxAt(
 		await cleanupStaleDockerContainers(cli);
 
 		const hostDir = hostDirForSandbox();
-		const containerID = await startDockerContainer(cli, image, hostDir, networkIsolated, mounts, workdirMount);
+		const containerID = await startDockerContainer(
+			cli,
+			image,
+			hostDir,
+			networkIsolated,
+			mounts,
+			workdirMount,
+			readOnlyMounts,
+		);
 
 		return {
 			type: "docker",
@@ -46,6 +55,7 @@ export async function newDockerSandbox(
 	networkIsolated: boolean,
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
+	readOnlyMounts: ReadOnlyMount[] = [],
 ): Promise<DockerBackend | null> {
 	const hosts = [
 		process.env.DOCKER_HOST,
@@ -56,7 +66,7 @@ export async function newDockerSandbox(
 
 	for (const host of hosts) {
 		if (!host) continue;
-		const backend = await newDockerSandboxAt(host, image, networkIsolated, mounts, workdirMount);
+		const backend = await newDockerSandboxAt(host, image, networkIsolated, mounts, workdirMount, readOnlyMounts);
 		if (backend) return backend;
 	}
 
@@ -94,6 +104,7 @@ async function startDockerContainer(
 	networkIsolated: boolean,
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
+	readOnlyMounts: ReadOnlyMount[] = [],
 ): Promise<string> {
 	try {
 		const pullStream = await cli.pull(image);
@@ -115,6 +126,11 @@ async function startDockerContainer(
 	for (const [hostPath, containerPath] of Object.entries(mounts)) {
 		const expandedHostPath = hostPath.replace(/^~/, `${homedir()}/`);
 		binds.push(`${expandedHostPath}:${containerPath}`);
+	}
+
+	// Read-only overlay mounts (e.g. protected config paths)
+	for (const ro of readOnlyMounts) {
+		binds.push(`${ro.host}:${ro.container}:ro`);
 	}
 
 	const createResult = await cli.createContainer({
