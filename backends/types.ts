@@ -16,6 +16,14 @@ export interface SandboxConfig {
 	workdirMount?: string;
 	/** Custom LLM-facing tools that run shell commands on the host (user-authored allowlist) */
 	hostTools?: HostTool[];
+	/** Shell command run inside the container right after it starts (e.g. "apk add git"). Non-zero exit is fatal. */
+	startupCommand?: string;
+	/** Like startupCommand, but always executed as in-container root (e.g. package installs). Runs before startupCommand. */
+	startupCommandAsRoot?: string;
+	/** Run all commands in the container as root (uid 0) instead of the host user. Default: false */
+	runAsRoot?: boolean;
+	/** Path to a Dockerfile to build and cache instead of using a prebuilt image. Takes precedence over `image`. */
+	dockerfile?: string;
 }
 
 /** A user-configured custom tool exposed to the LLM that runs a shell command on the host */
@@ -41,6 +49,10 @@ export const DEFAULT_CONFIG: SandboxConfig = {
 	mounts: {}, // Additional host directories to mount
 	workdirMount: "/workdir", // In-container mount point for the host cwd
 	hostTools: [], // Custom LLM-facing tools running shell commands on the host
+	startupCommand: "", // Shell command run inside the container at startup
+	startupCommandAsRoot: "", // Startup command run as in-container root (before startupCommand)
+	runAsRoot: false, // Run all container commands as root
+	dockerfile: "", // Dockerfile to build + cache (overrides `image`)
 };
 
 export class BackendUnavailableError extends Error {

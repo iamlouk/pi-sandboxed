@@ -4,12 +4,14 @@
  */
 
 import { platform } from "node:os";
+import type { DockerfileSpec } from "./image.ts";
 import { type AppleBackend, BackendUnavailableError, type ReadOnlyMount } from "./types.ts";
 import {
 	containerEnv,
 	findExecutableSync,
 	hostDirForSandbox,
 	isPidAlive,
+	runCliTimed,
 	runContainerCLI,
 	sandboxName,
 } from "./utils.ts";
@@ -20,6 +22,8 @@ export async function newAppleSandbox(
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
 	readOnlyMounts: ReadOnlyMount[] = [],
+	runAsRoot: boolean = false,
+	dockerfile: DockerfileSpec | null = null,
 ): Promise<AppleBackend | null> {
 	if (platform() !== "darwin") {
 		return null;
@@ -37,24 +41,33 @@ export async function newAppleSandbox(
 
 		await appleCleanupStale();
 
+		// Resolve the image: a Dockerfile is built (and cached under its content
+		// hash tag) if the cached image is not present yet.
+		let imageRef = image;
+		if (dockerfile) {
+			if (!(await appleImageExists(dockerfile.tag))) {
+				const { error } = await appleBuildImage(dockerfile);
+				if (error) {
+					throw new Error(`Failed to build image from ${dockerfile.path}: ${error}`);
+				}
+			}
+			imageRef = dockerfile.tag;
+		}
+
 		const hostDir = hostDirForSandbox();
 		const uid = process.getuid?.() || 0;
 		const gid = process.getgid?.() || 0;
 
-		const args = [
-			"run",
-			"--detach",
-			"--name",
-			sandboxName(),
-			"--uid",
-			uid.toString(),
-			"--gid",
-			gid.toString(),
-			"--workdir",
-			workdirMount,
-			"--mount",
-			`type=virtiofs,source=${hostDir},target=${workdirMount}`,
-		];
+		const args = ["run", "--detach", "--name", sandboxName()];
+
+		// Map the host user into the container, or run everything as root
+		if (runAsRoot) {
+			args.push("--uid", "0", "--gid", "0");
+		} else {
+			args.push("--uid", uid.toString(), "--gid", gid.toString());
+		}
+
+		args.push("--workdir", workdirMount, "--mount", `type=virtiofs,source=${hostDir},target=${workdirMount}`);
 
 		// Add additional mounts from config
 		for (const [hostPath, containerPath] of Object.entries(mounts)) {
@@ -75,7 +88,7 @@ export async function newAppleSandbox(
 		for (const envVar of containerEnv()) {
 			args.push("--env", envVar);
 		}
-		args.push(image, "sleep", "infinity");
+		args.push(imageRef, "sleep", "infinity");
 
 		const runResult = await runContainerCLI(args);
 		if (runResult.error) {
@@ -95,12 +108,31 @@ export async function newAppleSandbox(
 	}
 }
 
+export async function appleImageExists(tag: string): Promise<boolean> {
+	const [name, tagPart = "latest"] = tag.split(":");
+	const res = await runContainerCLI(["image", "list"]);
+	if (res.error) return false;
+	return res.output
+		.split("\n")
+		.slice(1)
+		.some((line) => {
+			const cols = line.trim().split(/\s+/);
+			return cols[0] === name && cols[1] === tagPart;
+		});
+}
+
+export async function appleBuildImage(spec: DockerfileSpec): Promise<{ error: string | null }> {
+	const res = await runCliTimed("container", ["build", "-f", spec.path, "-t", spec.tag, spec.context], 900);
+	return { error: res.error };
+}
+
 export async function runAppleExec(
 	backend: AppleBackend,
 	command: string,
 	timeout: number,
 	onData: (data: Buffer) => void,
 	signal?: AbortSignal,
+	asRoot = false,
 ): Promise<{ exitCode: number | null }> {
 	return new Promise((resolve, reject) => {
 		let timedOut = false;
@@ -113,7 +145,15 @@ export async function runAppleExec(
 			}, timeout * 1000);
 		}
 
-		const child = spawn("container", ["exec", backend.name, "/bin/sh", "-c", command], {
+		const execArgs = [
+			"exec",
+			...(asRoot ? ["--uid", "0", "--gid", "0"] : []),
+			backend.name,
+			"/bin/sh",
+			"-c",
+			command,
+		];
+		const child = spawn("container", execArgs, {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 

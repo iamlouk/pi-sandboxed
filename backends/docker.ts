@@ -2,8 +2,9 @@
  * Docker backend: drives any reachable Docker daemon through the @moby/moby SDK
  */
 
+import type { DockerfileSpec } from "./image.ts";
 import { BackendUnavailableError, type DockerBackend, type ReadOnlyMount } from "./types.ts";
-import { containerEnv, hostDirForSandbox, isPidAlive, sandboxName } from "./utils.ts";
+import { containerEnv, hostDirForSandbox, isPidAlive, runCliTimed, sandboxName } from "./utils.ts";
 
 export async function newDockerSandboxAt(
 	host: string,
@@ -12,6 +13,8 @@ export async function newDockerSandboxAt(
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
 	readOnlyMounts: ReadOnlyMount[] = [],
+	runAsRoot: boolean = false,
+	dockerfile: DockerfileSpec | null = null,
 ): Promise<DockerBackend | null> {
 	try {
 		const moby = await import("@moby/moby");
@@ -22,17 +25,31 @@ export async function newDockerSandboxAt(
 			throw new BackendUnavailableError(`Docker daemon at ${host} not reachable`);
 		}
 
+		// Resolve the image: a Dockerfile is built with the docker CLI (and
+		// cached under its content hash tag) if the cached image is missing.
+		let imageRef = image;
+		if (dockerfile) {
+			if (!(await dockerImageExists(dockerfile.tag))) {
+				const { error } = await dockerBuildImage(dockerfile);
+				if (error) {
+					throw new Error(`Failed to build image from ${dockerfile.path}: ${error}`);
+				}
+			}
+			imageRef = dockerfile.tag;
+		}
+
 		await cleanupStaleDockerContainers(cli);
 
 		const hostDir = hostDirForSandbox();
 		const containerID = await startDockerContainer(
 			cli,
-			image,
+			imageRef,
 			hostDir,
 			networkIsolated,
 			mounts,
 			workdirMount,
 			readOnlyMounts,
+			runAsRoot,
 		);
 
 		return {
@@ -56,6 +73,8 @@ export async function newDockerSandbox(
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
 	readOnlyMounts: ReadOnlyMount[] = [],
+	runAsRoot: boolean = false,
+	dockerfile: DockerfileSpec | null = null,
 ): Promise<DockerBackend | null> {
 	const hosts = [
 		process.env.DOCKER_HOST,
@@ -66,7 +85,16 @@ export async function newDockerSandbox(
 
 	for (const host of hosts) {
 		if (!host) continue;
-		const backend = await newDockerSandboxAt(host, image, networkIsolated, mounts, workdirMount, readOnlyMounts);
+		const backend = await newDockerSandboxAt(
+			host,
+			image,
+			networkIsolated,
+			mounts,
+			workdirMount,
+			readOnlyMounts,
+			runAsRoot,
+			dockerfile,
+		);
 		if (backend) return backend;
 	}
 
@@ -105,6 +133,7 @@ async function startDockerContainer(
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
 	readOnlyMounts: ReadOnlyMount[] = [],
+	runAsRoot: boolean = false,
 ): Promise<string> {
 	try {
 		const pullStream = await cli.pull(image);
@@ -136,7 +165,7 @@ async function startDockerContainer(
 	const createResult = await cli.createContainer({
 		name: sandboxName(),
 		Image: image,
-		User: `${uid}:${gid}`,
+		User: runAsRoot ? "0:0" : `${uid}:${gid}`,
 		Cmd: ["sleep", "infinity"],
 		Env: containerEnv(),
 		WorkingDir: workdirMount,
@@ -151,12 +180,23 @@ async function startDockerContainer(
 	return createResult.id;
 }
 
+export async function dockerImageExists(tag: string): Promise<boolean> {
+	const res = await runCliTimed("docker", ["images", "-q", tag], 30);
+	return !res.error && res.output.trim().length > 0;
+}
+
+export async function dockerBuildImage(spec: DockerfileSpec): Promise<{ error: string | null }> {
+	const res = await runCliTimed("docker", ["build", "-t", spec.tag, "-f", spec.path, spec.context], 900);
+	return { error: res.error };
+}
+
 export async function runDockerExec(
 	backend: DockerBackend,
 	command: string,
 	timeout: number,
 	onData: (data: Buffer) => void,
 	signal?: AbortSignal,
+	asRoot = false,
 ): Promise<{ exitCode: number | null }> {
 	const cli = backend.cli;
 	const containerID = backend.containerID;
@@ -176,6 +216,7 @@ export async function runDockerExec(
 			Cmd: ["/bin/sh", "-c", command],
 			AttachStdout: true,
 			AttachStderr: true,
+			...(asRoot ? { User: "0:0" } : {}),
 		};
 
 		cli.createExec(containerID, execOptions)

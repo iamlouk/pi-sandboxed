@@ -97,3 +97,44 @@ export async function runContainerCLI(args: string[]): Promise<{ output: string;
 		});
 	});
 }
+
+/** Run a CLI command with a timeout, capturing stdout/stderr. */
+export function runCliTimed(
+	cli: string,
+	args: string[],
+	timeoutSeconds: number,
+): Promise<{ output: string; error: string | null }> {
+	return new Promise((resolve) => {
+		let timedOut = false;
+		const child = spawn(cli, args, {
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGKILL");
+		}, timeoutSeconds * 1000);
+
+		let stdout = "";
+		let stderr = "";
+		child.stdout?.on("data", (d) => {
+			stdout += d.toString();
+		});
+		child.stderr?.on("data", (d) => {
+			stderr += d.toString();
+		});
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({ output: stdout, error: `failed to run ${cli}: ${err}` });
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			if (timedOut) {
+				resolve({ output: stdout, error: `timed out after ${timeoutSeconds}s` });
+			} else if (code !== 0) {
+				resolve({ output: stdout, error: stderr || `exit code ${code}` });
+			} else {
+				resolve({ output: stdout, error: null });
+			}
+		});
+	});
+}

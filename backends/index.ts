@@ -5,8 +5,10 @@
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 import { backendCleanupApple, newAppleSandbox, runAppleExec } from "./apple.ts";
 import { backendCleanupDocker, newDockerSandbox, runDockerExec } from "./docker.ts";
+import type { DockerfileSpec } from "./image.ts";
 import { type AnyBackend, type BackendResult, BackendUnavailableError, type ReadOnlyMount } from "./types.ts";
 
+export { type DockerfileSpec, dockerfileSpec } from "./image.ts";
 export { BackendUnavailableError, DEFAULT_CONFIG, SandboxConfig } from "./types.ts";
 export { containerEnv, hostDirForSandbox, sandboxName } from "./utils.ts";
 
@@ -17,12 +19,14 @@ async function tryBackend(
 	mounts: Record<string, string>,
 	workdirMount: string,
 	readOnlyMounts: ReadOnlyMount[],
+	runAsRoot: boolean,
+	dockerfile: DockerfileSpec | null,
 ): Promise<AnyBackend | null> {
 	switch (type) {
 		case "apple":
-			return newAppleSandbox(image, networkIsolated, mounts, workdirMount, readOnlyMounts);
+			return newAppleSandbox(image, networkIsolated, mounts, workdirMount, readOnlyMounts, runAsRoot, dockerfile);
 		case "docker":
-			return newDockerSandbox(image, networkIsolated, mounts, workdirMount, readOnlyMounts);
+			return newDockerSandbox(image, networkIsolated, mounts, workdirMount, readOnlyMounts, runAsRoot, dockerfile);
 	}
 }
 
@@ -33,6 +37,8 @@ export async function selectBackend(
 	mounts: Record<string, string> = {},
 	workdirMount: string = "/workdir",
 	readOnlyMounts: ReadOnlyMount[] = [],
+	runAsRoot: boolean = false,
+	dockerfile: DockerfileSpec | null = null,
 ): Promise<BackendResult | null> {
 	if (forced && forced !== "auto") {
 		const backend = await tryBackend(
@@ -42,6 +48,8 @@ export async function selectBackend(
 			mounts,
 			workdirMount,
 			readOnlyMounts,
+			runAsRoot,
+			dockerfile,
 		);
 		if (backend) {
 			return { backend, cleanup: () => backendCleanup(backend), networkIsolated };
@@ -52,7 +60,16 @@ export async function selectBackend(
 	// Try auto selection: apple -> docker
 	const backends = ["apple", "docker"] as const;
 	for (const type of backends) {
-		const backend = await tryBackend(type, image, networkIsolated, mounts, workdirMount, readOnlyMounts);
+		const backend = await tryBackend(
+			type,
+			image,
+			networkIsolated,
+			mounts,
+			workdirMount,
+			readOnlyMounts,
+			runAsRoot,
+			dockerfile,
+		);
 		if (backend) {
 			return { backend, cleanup: () => backendCleanup(backend), networkIsolated };
 		}
@@ -67,6 +84,26 @@ async function backendCleanup(backend: AnyBackend): Promise<void> {
 			return backendCleanupDocker(backend);
 		case "apple":
 			return backendCleanupApple(backend);
+	}
+}
+
+/**
+ * Run a one-off command in the sandbox container, optionally as in-container root
+ * (used for startup commands; the bash tool uses the container's default user).
+ */
+export async function execInBackend(
+	backend: AnyBackend,
+	command: string,
+	timeout: number,
+	onData: (data: Buffer) => void,
+	asRoot = false,
+	signal?: AbortSignal,
+): Promise<{ exitCode: number | null }> {
+	switch (backend.type) {
+		case "docker":
+			return runDockerExec(backend, command, timeout, onData, signal, asRoot);
+		case "apple":
+			return runAppleExec(backend, command, timeout, onData, signal, asRoot);
 	}
 }
 

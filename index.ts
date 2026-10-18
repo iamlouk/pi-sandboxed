@@ -27,7 +27,15 @@ import { join, posix, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 
-import { createSandboxedBashOps, DEFAULT_CONFIG, sandboxName, selectBackend } from "./backends/index";
+import {
+	createSandboxedBashOps,
+	DEFAULT_CONFIG,
+	type DockerfileSpec,
+	dockerfileSpec,
+	execInBackend,
+	sandboxName,
+	selectBackend,
+} from "./backends/index";
 import type { AnyBackend, ReadOnlyMount } from "./backends/types";
 import { configFilePaths, loadConfig } from "./config";
 import { registerChoicesTool } from "./extras/choices";
@@ -314,6 +322,21 @@ export default function (pi: ExtensionAPI) {
 		const networkIsolated = !networkAllowed && (config.networkIsolated ?? DEFAULT_CONFIG.networkIsolated!);
 		const netInfo = networkIsolated ? "NO network" : "network allowed";
 		const workdirMount = posix.normalize(config.workdirMount || DEFAULT_CONFIG.workdirMount!);
+		const runAsRoot = config.runAsRoot ?? DEFAULT_CONFIG.runAsRoot!;
+
+		// Resolve the Dockerfile (if configured): built once, then cached under
+		// a content-hash tag and reused on later sessions.
+		let dockerfile: DockerfileSpec | null = null;
+		const dockerfilePath = (config.dockerfile || DEFAULT_CONFIG.dockerfile!).trim();
+		if (dockerfilePath) {
+			const absPath = toAbsoluteHostPath(dockerfilePath, ctx.cwd);
+			if (!existsSync(absPath)) {
+				console.error(`FATAL: pi-sandboxed dockerfile not found: ${absPath}`);
+				ctx.ui.notify(`FATAL: dockerfile not found: ${absPath}. Sandbox cannot be initialized, exiting.`, "error");
+				process.exit(1);
+			}
+			dockerfile = dockerfileSpec(absPath);
+		}
 
 		// Read-only protection for the project pi config dir: if the sandbox
 		// config lives inside the mounted workdir, sandboxed bash could edit it
@@ -330,6 +353,8 @@ export default function (pi: ExtensionAPI) {
 				mounts,
 				workdirMount,
 				readOnlyMounts,
+				runAsRoot,
+				dockerfile,
 			);
 			if (!result) {
 				throw new Error("No sandbox backend available (tried apple, docker)");
@@ -348,7 +373,7 @@ export default function (pi: ExtensionAPI) {
 				backend: result.backend,
 				cleanup: result.cleanup,
 				backendType: result.backend.type,
-				image: config.image || DEFAULT_CONFIG.image!,
+				image: dockerfile ? dockerfile.tag : config.image || DEFAULT_CONFIG.image!,
 				netInfo,
 				networkIsolated,
 				workdirMount,
@@ -356,6 +381,35 @@ export default function (pi: ExtensionAPI) {
 				readOnlyMounts,
 			};
 			sandbox = state;
+
+			// Run the user-configured startup commands inside the container (as
+			// root first, then as the container's default user). A failing (or
+			// hanging) setup command is fatal: the sandbox would be missing whatever
+			// the command was supposed to provide.
+			const startupRoot = (config.startupCommandAsRoot || DEFAULT_CONFIG.startupCommandAsRoot!).trim();
+			const startup = (config.startupCommand || DEFAULT_CONFIG.startupCommand!).trim();
+			for (const [command, asRoot, label] of [
+				[startupRoot, true, "startupCommandAsRoot"],
+				[startup, false, "startupCommand"],
+			] as const) {
+				if (!command) continue;
+				let output = "";
+				const { exitCode } = await execInBackend(
+					state.backend,
+					command,
+					300,
+					(d) => {
+						output += d.toString();
+					},
+					asRoot,
+				);
+				if (exitCode !== 0) {
+					throw new Error(
+						`${label} failed with exit code ${exitCode}: ${command}` +
+							(output.trim() ? `\n${output.trim().slice(0, 2000)}` : ""),
+					);
+				}
+			}
 
 			// Update bash tool description
 			const allTools = pi.getAllTools();
@@ -376,7 +430,10 @@ export default function (pi: ExtensionAPI) {
 				"info",
 			);
 		} catch (err) {
-			// Hard failure - exit pi if sandbox cannot be initialized
+			// Hard failure - exit pi if sandbox cannot be initialized.
+			// ctx.ui.notify is a no-op outside the TUI, so also log to stderr.
+			const message = `Sandbox initialization failed: ${err instanceof Error ? err.message : err}`;
+			console.error(`FATAL: ${message}. Sandbox required but cannot be initialized, exiting.`);
 			ctx.ui.notify(`Sandbox initialization failed: ${err}`, "error");
 			ctx.ui.notify("FATAL: Sandbox required but cannot be initialized. Exiting.", "error");
 			process.exit(1);
@@ -418,9 +475,12 @@ export default function (pi: ExtensionAPI) {
 					`Image: ${config.image || DEFAULT_CONFIG.image}`,
 					`Network: ${networkIsolated ? "ISOLATED" : "ALLOWED"}`,
 					`Backend: ${config.backend} (forced: ${forcedBackend || "none"})`,
+					`Image: ${dockerfile ? `dockerfile build (${dockerfile.tag})` : config.image || DEFAULT_CONFIG.image}`,
 					...mountLines,
 					...roLines,
 					`Host tools: ${hostToolNames.length > 0 ? hostToolNames.join(", ") : "none"}`,
+					`Startup commands: ${[config.startupCommandAsRoot, config.startupCommand].filter(Boolean).join(" && ") || "none"}`,
+					`Container user: ${sandbox ? (config.runAsRoot ? "root" : "host user") : "n/a"}`,
 					`Config protected: ${existsSync(projectPiDir) ? (sandbox ? "yes (.pi read-only)" : "write/edit only") : "no .pi dir"}`,
 					`Container: ${sandbox ? sandboxName() : "none"}`,
 				].join("\n"),
